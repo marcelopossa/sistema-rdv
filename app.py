@@ -1,0 +1,616 @@
+import re
+from flask import Flask, render_template, request, jsonify, send_file
+from flask import render_template_string
+import pdfkit
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.utils import secure_filename
+import os
+from datetime import datetime, date
+import json
+from utils.pdf_processor import processar_pdf, debug_pdf_content
+from utils.excel_generator import gerar_excel_rdv
+from utils.pdf_generator import gerar_pdf_completo
+
+
+def processar_nfc_e(texto):
+    """Processa texto de NFC-e e extrai informações relevantes - VERSÃO CORRIGIDA"""
+    try:
+        print(f"🔍 Processando NFC-e...")
+        print(f"📄 Amostra: {texto[:100]}...")
+        
+        # Extrair valor total - padrões mais robustos
+        valor_patterns = [
+            r'Valor total R\$\s*([\d.,]+)',
+            r'VALOR TOTAL.*?R\$\s*([\d.,]+)',
+            r'Total.*?R\$\s*([\d.,]+)'
+        ]
+        
+        valor = 0
+        for pattern in valor_patterns:
+            valor_match = re.search(pattern, texto, re.IGNORECASE)
+            if valor_match:
+                valor_str = valor_match.group(1).replace('.', '').replace(',', '.')
+                valor = float(valor_str)
+                print(f"💰 Valor encontrado: R$ {valor:.2f}")
+                break
+        
+        if valor == 0:
+            print("⚠️ Valor total não encontrado na NFC-e")
+            return 0
+        
+        # Palavras-chave específicas dos documentos do usuário
+        keywords_alimentacao = [
+            # Nomes específicos dos estabelecimentos
+            'per tutti',           # Restaurante Per Tutti
+            'rosa dos santos',     # Rosa dos Santos Rest
+            # Tipos gerais
+            'restaurante', 'rest ', 'rest.', 'rest,', 'restaurant',
+            'lanchonete', 'padaria', 'pizzaria', 'hamburgueria',
+            'confeitaria', 'pastelaria', 'churrascaria', 'cantina',
+            # Cafés e bebidas
+            'cafe', 'café', 'coffee', 'bar ', 'pub', 'bistro',
+            # Produtos/serviços específicos
+            'refeição', 'refeicao', 'buffet', 'comida', 'alimento',
+            'bebida', 'diversos/bebidas', 'pizza', 'lanche',
+            # Palavras em inglês
+            'food', 'meal', 'dinner', 'lunch', 'breakfast'
+        ]
+        
+        texto_lower = texto.lower()
+        
+        # Verificar palavras-chave encontradas
+        palavras_encontradas = []
+        for keyword in keywords_alimentacao:
+            if keyword in texto_lower:
+                palavras_encontradas.append(keyword)
+        
+        if palavras_encontradas:
+            print(f"✅ ALIMENTAÇÃO identificada! Palavras: {palavras_encontradas}")
+            print(f"💰 Valor de alimentação: R$ {valor:.2f}")
+            return valor
+        else:
+            print(f"ℹ️ NFC-e não classificada como alimentação")
+            return 0
+            
+    except Exception as e:
+        print(f"❌ Erro ao processar NFC-e: {e}")
+        import traceback
+        traceback.print_exc()
+        return 0
+
+# Configuração da aplicação
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'sistema-rdv-2025-seguro'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///rdv.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = 'static/uploads'
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max
+
+# Inicializar banco
+db = SQLAlchemy(app)
+
+# Criar pastas necessárias
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Modelos do banco de dados
+class Cliente(db.Model):
+    __tablename__ = 'cliente'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    nome = db.Column(db.String(100), nullable=False)
+    valor_km = db.Column(db.Float, nullable=False)
+    km_padrao = db.Column(db.Float, default=0)
+    contato = db.Column(db.String(100))
+    endereco = db.Column(db.String(200))
+    observacoes = db.Column(db.Text)
+    ativo = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    viagens = db.relationship('Viagem', backref='cliente', lazy=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'nome': self.nome,
+            'valor_km': self.valor_km,
+            'km_padrao': self.km_padrao,
+            'contato': self.contato or '',
+            'endereco': self.endereco or '',
+            'observacoes': self.observacoes or ''
+        }
+
+class Viagem(db.Model):
+    __tablename__ = 'viagem'
+    
+    id = db.Column(db.Integer, primary_key=True)
+    data_viagem = db.Column(db.Date, nullable=False)
+    cliente_id = db.Column(db.Integer, db.ForeignKey('cliente.id'), nullable=False)
+    projeto = db.Column(db.String(100))
+    participantes = db.Column(db.String(200), nullable=False)
+    beneficiario = db.Column(db.String(100), default='MARCELO POSSA')
+    
+    km_rodado = db.Column(db.Float, nullable=False)
+    valor_km = db.Column(db.Float, nullable=False)
+    total_km = db.Column(db.Float, nullable=False)
+    
+    valor_pedagio = db.Column(db.Float, default=0)
+    valor_alimentacao = db.Column(db.Float, default=0)
+    valor_hospedagem = db.Column(db.Float, default=0)
+    total_geral = db.Column(db.Float, nullable=False)
+    
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'data_viagem': self.data_viagem.strftime('%Y-%m-%d'),
+            'cliente_nome': self.cliente.nome,
+            'projeto': self.projeto or '-',
+            'km_rodado': self.km_rodado,
+            'total_geral': self.total_geral
+        }
+
+# Rotas da aplicação
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/clientes', methods=['GET'])
+def listar_clientes():
+    try:
+        clientes = Cliente.query.filter_by(ativo=True).all()
+        return jsonify([cliente.to_dict() for cliente in clientes])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/clientes', methods=['POST'])
+def criar_cliente():
+    try:
+        data = request.json
+        
+        cliente = Cliente(
+            nome=data['nome'],
+            valor_km=float(data['valor_km']),
+            km_padrao=float(data.get('km_padrao', 0)),
+            contato=data.get('contato', ''),
+            endereco=data.get('endereco', ''),
+            observacoes=data.get('observacoes', '')
+        )
+        
+        db.session.add(cliente)
+        db.session.commit()
+        
+        return jsonify({'id': cliente.id, 'message': 'Cliente criado com sucesso!'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/clientes/<int:cliente_id>', methods=['PUT'])
+def atualizar_cliente(cliente_id):
+    try:
+        cliente = Cliente.query.get_or_404(cliente_id)
+        data = request.json
+        
+        cliente.nome = data['nome']
+        cliente.valor_km = float(data['valor_km'])
+        cliente.km_padrao = float(data.get('km_padrao', 0))
+        cliente.contato = data.get('contato', '')
+        cliente.endereco = data.get('endereco', '')
+        cliente.observacoes = data.get('observacoes', '')
+        
+        db.session.commit()
+        return jsonify({'message': 'Cliente atualizado com sucesso!'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/clientes/<int:cliente_id>', methods=['DELETE'])
+def excluir_cliente(cliente_id):
+    try:
+        cliente = Cliente.query.get_or_404(cliente_id)
+        cliente.ativo = False
+        db.session.commit()
+        return jsonify({'message': 'Cliente excluído com sucesso!'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/processar-documentos', methods=['POST'])
+def processar_documentos():
+    try:
+        print("🚀 Processamento de documentos iniciado")
+        print("📋 Files received:", list(request.files.keys()))
+        
+        resultados = {
+            'pedagio': 0,
+            'alimentacao': 0,
+            'hospedagem': 0,
+            'arquivos_processados': []
+        }
+        
+        # Debug detalhado dos arquivos
+        total_files = 0
+        for field_name in request.files:
+            files = request.files.getlist(field_name)
+            print("📁 Campo '{}': {} arquivo(s)".format(field_name, len(files)))
+            for file in files:
+                if file.filename:
+                    print("   - {} ({})".format(file.filename, file.content_type))
+                    total_files += 1
+        
+        print("📊 Total de arquivos válidos:", total_files)
+        
+        # Processar cada tipo de arquivo COM PROCESSAMENTO REAL
+        tipos_campos = {
+            'pedagio': 'pedagioFile',
+            'alimentacao': 'alimentacaoFiles',
+            'hospedagem': 'hospedagemFiles'
+        }
+        
+        for tipo, field_name in tipos_campos.items():
+            files = request.files.getlist(field_name)
+            print("\n🔄 Processando {} arquivo(s) de {}".format(len(files), tipo))
+            
+            for file in files:
+                if file and file.filename:
+                    try:
+                        # Salvar arquivo temporariamente
+                        filename = secure_filename(file.filename)
+                        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_')
+                        safe_filename = timestamp + filename
+                        filepath = os.path.join(app.config['UPLOAD_FOLDER'], safe_filename)
+                        
+                        file.save(filepath)
+                        print("💾 Arquivo salvo:", filepath)
+                        
+                        # PROCESSAR PDF REAL
+                        print("📄 Iniciando extração de {} do arquivo: {}".format(tipo, filename))
+                        valor_extraido = processar_pdf(filepath, tipo)
+                        
+                        # Somar ao total do tipo
+                        resultados[tipo] += valor_extraido
+                        
+                        # Adicionar aos arquivos processados
+                        resultados['arquivos_processados'].append({
+                            'tipo': tipo,
+                            'nome': filename,
+                            'valor': valor_extraido,
+                            'status': 'sucesso' if valor_extraido > 0 else 'valor_nao_encontrado'
+                        })
+                        
+                        print("✅ {}: R$ {:.2f}".format(filename, valor_extraido))
+                        
+                    except Exception as e:
+                        print("❌ Erro ao processar {}: {}".format(file.filename, e))
+                        import traceback
+                        traceback.print_exc()
+                        
+                        resultados['arquivos_processados'].append({
+                            'tipo': tipo,
+                            'nome': file.filename,
+                            'valor': 0,
+                            'status': 'erro',
+                            'erro': str(e)
+                        })
+        
+        print("\n🎉 Processamento concluído!")
+        print("📊 Resumo:")
+        print("   - Pedágio: R$ {:.2f}".format(resultados['pedagio']))
+        print("   - Alimentação: R$ {:.2f}".format(resultados['alimentacao']))
+        print("   - Hospedagem: R$ {:.2f}".format(resultados['hospedagem']))
+        
+        return jsonify(resultados)
+        
+    except Exception as e:
+        print("❌ Erro geral no processamento:", str(e))
+        import traceback
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/viagens', methods=['POST'])
+def criar_viagem():
+    try:
+        data = request.json
+        
+        total_km = float(data['km_rodado']) * float(data['valor_km'])
+        total_geral = total_km + float(data['valor_pedagio']) + float(data['valor_alimentacao']) + float(data['valor_hospedagem'])
+        
+        viagem = Viagem(
+            data_viagem=datetime.strptime(data['data_viagem'], '%Y-%m-%d').date(),
+            cliente_id=int(data['cliente_id']),
+            projeto=data.get('projeto', ''),
+            participantes=data['participantes'],
+            km_rodado=float(data['km_rodado']),
+            valor_km=float(data['valor_km']),
+            total_km=total_km,
+            valor_pedagio=float(data['valor_pedagio']),
+            valor_alimentacao=float(data['valor_alimentacao']),
+            valor_hospedagem=float(data['valor_hospedagem']),
+            total_geral=total_geral
+        )
+        
+        db.session.add(viagem)
+        db.session.commit()
+        
+        return jsonify({
+            'id': viagem.id,
+            'message': 'Viagem criada com sucesso!',
+            'total_geral': total_geral
+        })
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+@app.route('/api/viagens', methods=['GET'])
+def listar_viagens():
+    try:
+        viagens = Viagem.query.join(Cliente).order_by(Viagem.data_viagem.desc()).all()
+        return jsonify([viagem.to_dict() for viagem in viagens])
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/test')
+def test():
+    return jsonify({
+        'status': 'ok',
+        'message': 'Sistema RDV funcionando!',
+        'database': 'conectado'
+    })
+
+
+@app.route('/api/gerar-excel/<int:viagem_id>')
+def gerar_excel_viagem(viagem_id):
+    try:
+        viagem = Viagem.query.get_or_404(viagem_id)
+        
+        print(f"📊 Gerando Excel para viagem {viagem_id}")
+        filepath, filename = gerar_excel_rdv(viagem)
+        
+        if filepath and os.path.exists(filepath):
+            return send_file(
+                filepath,
+                as_attachment=True,
+                download_name=filename,
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+        else:
+            return jsonify({'error': 'Erro ao gerar Excel'}), 500
+            
+    except Exception as e:
+        print(f"❌ Erro na rota Excel: {e}")
+        return jsonify({'error': str(e)}), 500
+
+def init_db():
+    try:
+        print("🔄 Verificando banco de dados...")
+        
+        # Criar todas as tabelas se não existirem
+        db.create_all()
+        print("✅ Banco de dados verificado!")
+        
+        # Verificar se já existem clientes
+        count = Cliente.query.count()
+        print("📊 Clientes existentes:", count)
+        
+        if count == 0:
+            print("🔄 Criando clientes padrão...")
+            clientes_padrao = [
+                Cliente(
+                    nome='Conpasul',
+                    valor_km=1.00,
+                    km_padrao=226,
+                    contato='contato@conpasul.com.br',
+                    endereco='Porto Alegre, RS',
+                    observacoes='Cliente padrão, viagens frequentes'
+                ),
+                Cliente(
+                    nome='TechCorp',
+                    valor_km=1.20,
+                    km_padrao=180,
+                    contato='(51) 3333-4444',
+                    endereco='São Paulo, SP',
+                    observacoes='Valor diferenciado para projetos especiais'
+                )
+            ]
+            
+            for cliente in clientes_padrao:
+                db.session.add(cliente)
+            
+            db.session.commit()
+            print("✅ Clientes padrão criados com KM padrão!")
+        else:
+            print("✅ Banco já possui dados!")
+            
+    except Exception as e:
+        print("❌ Erro ao inicializar banco:", str(e))
+        import traceback
+        traceback.print_exc()
+        return False
+    return True
+
+
+@app.route('/api/gerar-pdf/<int:viagem_id>')
+def gerar_pdf_viagem(viagem_id):
+    try:
+        print(f"📊 Gerando PDF para viagem {viagem_id}")
+        
+        viagem = Viagem.query.get_or_404(viagem_id)
+        
+        # Debug: verificar dados da viagem
+        print(f"📋 Dados da viagem: {viagem.beneficiario}")
+        # Debug: verificar dados da viagem
+        print(f"📋 Dados da viagem: {viagem.beneficiario}")
+        
+        # Usar getattr para evitar erros de atributo
+        pedagio = getattr(viagem, 'total_pedagio', None) or getattr(viagem, 'valor_pedagio', None) or getattr(viagem, 'pedagio', 0)
+        alimentacao = getattr(viagem, 'total_alimentacao', None) or getattr(viagem, 'valor_alimentacao', None) or getattr(viagem, 'alimentacao', 0)
+        hospedagem = getattr(viagem, 'total_hospedagem', None) or getattr(viagem, 'valor_hospedagem', None) or getattr(viagem, 'hospedagem', 0)
+        
+        print(f"💰 Valores - Pedágio: R$ {pedagio}, Alimentação: R$ {alimentacao}, Hospedagem: R$ {hospedagem}")
+        
+        # Template HTML embutido (mais seguro)
+        html_template = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <title>Relatório de Despesas de Viagem</title>
+    <style>
+        @page { size: A4; margin: 2cm; }
+        body { font-family: Arial, sans-serif; font-size: 12px; line-height: 1.4; color: #333; }
+        .header { text-align: center; border-bottom: 2px solid #333; padding-bottom: 10px; margin-bottom: 20px; }
+        .company-name { font-size: 18px; font-weight: bold; margin-bottom: 5px; }
+        .document-title { font-size: 16px; font-weight: bold; margin-top: 10px; }
+        .info-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        .info-table td { border: 1px solid #ccc; padding: 8px; vertical-align: top; }
+        .info-label { background-color: #f5f5f5; font-weight: bold; width: 200px; }
+        .expenses-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; }
+        .expenses-table th, .expenses-table td { border: 1px solid #333; padding: 8px; text-align: left; }
+        .expenses-table th { background-color: #f0f0f0; font-weight: bold; }
+        .total-row { font-weight: bold; background-color: #f9f9f9; }
+        .footer { margin-top: 30px; font-size: 10px; text-align: center; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="company-name">CONPASUL</div>
+        <div class="document-title">RELATÓRIO DE DESPESAS DE VIAGEM</div>
+    </div>
+
+    <table class="info-table">
+        <tr>
+            <td class="info-label">Beneficiário:</td>
+            <td>{{ beneficiario }}</td>
+            <td class="info-label">Período:</td>
+            <td>{{ data_inicio }} a {{ data_fim }}</td>
+        </tr>
+        <tr>
+            <td class="info-label">Data de Emissão:</td>
+            <td>{{ data_atual }}</td>
+            <td class="info-label">Observações:</td>
+            <td>{{ observacoes }}</td>
+        </tr>
+    </table>
+
+    <table class="expenses-table">
+        <thead>
+            <tr>
+                <th>Tipo de Despesa</th>
+                <th>Valor (R$)</th>
+            </tr>
+        </thead>
+        <tbody>
+            <tr>
+                <td>Hospedagem</td>
+                <td>{{ "%.2f"|format(total_hospedagem) }}</td>
+            </tr>
+            <tr>
+                <td>Refeições</td>
+                <td>{{ "%.2f"|format(total_alimentacao) }}</td>
+            </tr>
+            <tr>
+                <td>Pedágio</td>
+                <td>{{ "%.2f"|format(total_pedagio) }}</td>
+            </tr>
+            <tr class="total-row">
+                <td><strong>TOTAL</strong></td>
+                <td><strong>{{ "%.2f"|format(total_hospedagem + total_alimentacao + total_pedagio) }}</strong></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <div class="footer">
+        Documento gerado automaticamente pelo sistema RDV - {{ data_atual }}
+    </div>
+</body>
+</html>"""
+        
+        # Preparar dados para o template com getattr seguro
+        dados = {
+            'beneficiario': getattr(viagem, 'beneficiario', None) or getattr(viagem, 'nome', 'MARCELO POSSA'),
+            'data_inicio': (getattr(viagem, 'data_inicio', None) or getattr(viagem, 'data_viagem', None) or datetime.now()).strftime('%d/%m/%Y'),
+            'data_fim': (getattr(viagem, 'data_fim', None) or getattr(viagem, 'data_viagem', None) or datetime.now()).strftime('%d/%m/%Y'),
+            'data_atual': datetime.now().strftime('%d/%m/%Y'),
+            'observacoes': getattr(viagem, 'observacoes', None) or getattr(viagem, 'projeto', '-'),
+            'total_hospedagem': getattr(viagem, 'total_hospedagem', None) or getattr(viagem, 'valor_hospedagem', None) or getattr(viagem, 'hospedagem', 0),
+            'total_alimentacao': getattr(viagem, 'total_alimentacao', None) or getattr(viagem, 'valor_alimentacao', None) or getattr(viagem, 'alimentacao', 0),
+            'total_pedagio': getattr(viagem, 'total_pedagio', None) or getattr(viagem, 'valor_pedagio', None) or getattr(viagem, 'pedagio', 0)
+        }
+        
+        print(f"📊 Dados do template:")
+        for key, value in dados.items():
+            print(f"  {key}: {value}")
+        
+        print("📝 Renderizando template HTML...")
+        
+        # Renderizar template HTML
+        html = render_template_string(html_template, **dados)
+        print("✅ Template renderizado com sucesso")
+        
+        # Configurar wkhtmltopdf com configurações robustas
+        options = {
+            'page-size': 'A4',
+            'margin-top': '0.75in',
+            'margin-right': '0.75in',
+            'margin-bottom': '0.75in',
+            'margin-left': '0.75in',
+            'encoding': "UTF-8",
+            'no-outline': None,
+            'enable-local-file-access': None,
+            'disable-smart-shrinking': None
+        }
+        
+        print("🔄 Iniciando geração do PDF com wkhtmltopdf...")
+        
+        # Verificar se wkhtmltopdf está disponível
+        import subprocess
+        try:
+            subprocess.run(['wkhtmltopdf', '--version'], check=True, capture_output=True)
+            print("✅ wkhtmltopdf encontrado")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("❌ wkhtmltopdf não encontrado!")
+            return jsonify({"error": "wkhtmltopdf não instalado. Execute: sudo apt-get install -y wkhtmltopdf"}), 500
+        
+        # Gerar PDF
+        pdf = pdfkit.from_string(html, False, options=options)
+        print("✅ PDF gerado em memória com sucesso")
+        
+        # Nome do arquivo
+        nome_arquivo = f"RDV_{getattr(viagem, 'beneficiario', 'Viagem').replace(' ', '_')}_{(getattr(viagem, 'data_inicio', None) or getattr(viagem, 'data_viagem', None) or datetime.now()).strftime('%Y%m%d')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        
+        # Garantir que o diretório existe
+        upload_folder = app.config['UPLOAD_FOLDER']
+        os.makedirs(upload_folder, exist_ok=True)
+        
+        # Salvar arquivo
+        caminho_arquivo = os.path.join(upload_folder, nome_arquivo)
+        with open(caminho_arquivo, 'wb') as f:
+            f.write(pdf)
+        
+        print(f"✅ PDF salvo com sucesso: {caminho_arquivo}")
+        print(f"📄 Tamanho do arquivo: {len(pdf)} bytes")
+        
+        # Retornar arquivo para download
+        return send_file(
+            caminho_arquivo,
+            as_attachment=True,
+            download_name=nome_arquivo,
+            mimetype='application/pdf'
+        )
+        
+    except Exception as e:
+        print(f"❌ ERRO DETALHADO ao gerar PDF:")
+        print(f"   Tipo: {type(e).__name__}")
+        print(f"   Mensagem: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": f"Erro ao gerar PDF: {str(e)}"}), 500
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        if init_db():
+            print("🚀 Iniciando Sistema RDV com processamento real...")
+            app.run(host='0.0.0.0', port=5000, debug=True)
+        else:
+            print("❌ Falha na inicialização do banco!")
